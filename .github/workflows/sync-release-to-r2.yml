@@ -31,7 +31,17 @@ permissions:
 
 env:
   R2_BUCKET: frontier-release-assets
-  WEBSITE_BASE_URL: https://www.frontierstageworks.com
+  # The notify call below is machine-to-machine (HMAC-authenticated at the
+  # application layer), but the custom domain sits behind Cloudflare's
+  # zone-level bot protection, which blocks GitHub Actions' runner IPs by
+  # default — confirmed live (curl exit 22 / HTTP 403) on the first real
+  # sync. The *.workers.dev URL runs the exact same Worker/code, isn't part
+  # of that zone, and isn't subject to its bot rules, so it sidesteps the
+  # block without touching any Cloudflare security setting. Depends on the
+  # Worker's `name` ("website") and the account's workers.dev subdomain
+  # staying as they are; human-facing /latest/* links are unaffected, since
+  # those are only ever given out as the branded custom-domain URL.
+  WEBSITE_BASE_URL: https://website.markstalzer.workers.dev
 
 jobs:
   sync:
