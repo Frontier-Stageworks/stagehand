@@ -50,7 +50,7 @@ jobs:
           elif [ -n "$EVENT_TAG" ]; then
             TAG="$EVENT_TAG"
           else
-            TAG=$(gh release list --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName')
+            TAG=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName')
           fi
           if [ -z "$TAG" ]; then
             echo "::error::No release tag to sync (none given, and no published release found)"
@@ -68,7 +68,7 @@ jobs:
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
-          gh release view "$TAG" --json isDraft,isPrerelease,publishedAt,url > release.json
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,publishedAt,url > release.json
           IS_DRAFT=$(jq -r '.isDraft' release.json)
           IS_PRERELEASE=$(jq -r '.isPrerelease' release.json)
           if [ "$IS_DRAFT" = "true" ] || [ "$IS_PRERELEASE" = "true" ]; then
@@ -88,7 +88,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p assets
-          gh release download "$TAG" --dir assets --clobber
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir assets --clobber
 
       - name: Configure R2 credentials for the AWS CLI
         if: steps.release.outputs.skip != 'true'
