@@ -209,6 +209,21 @@ jobs:
         run: |
           set -euo pipefail
 
+          # The publish-release.yml pipeline reuses the private repo's tag
+          # verbatim as the public tag (client-v1.2.0, pi-v1.0.1) — strip
+          # that known prefix for the *version* sent to the website, so it
+          # displays as "v1.2.0" instead of "vclient-v1.2.0", and so it's
+          # bare X.Y.Z for the website's strict-semver ordering comparison
+          # to actually engage instead of silently falling back to
+          # published_at. release_tag keeps the untouched tag either way. A
+          # hand-uploaded ad-hoc tag (e.g. "Beta_0_4") has no such prefix and
+          # passes through unchanged.
+          case "$TAG" in
+            client-v*) VERSION="${TAG#client-v}" ;;
+            pi-v*) VERSION="${TAG#pi-v}" ;;
+            *) VERSION="$TAG" ;;
+          esac
+
           sync_one() {
             local file="$1" platform="$2" is_signature="$3"
             local filename checksum size key payload signature
@@ -222,7 +237,7 @@ jobs:
 
             payload=$(jq -n \
               --arg platform "$platform" \
-              --arg version "$TAG" \
+              --arg version "$VERSION" \
               --arg release_tag "$TAG" \
               --arg release_notes_url "$NOTES_URL" \
               --arg published_at "$PUBLISHED_AT" \
