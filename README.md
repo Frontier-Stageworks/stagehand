@@ -6,11 +6,11 @@ Stagehand is a camera tracking appliance for virtual production, leveraging ligh
 
 Learn more at [www.frontierstageworks.com](https://www.frontierstageworks.com).
 
-**Stagehand is currently in beta, with general launch coming soon.**
+**Stagehand is now available.**
 
 This repository hosts public Stagehand files, including client software, agent updates, and documentation.
 
-Download the latest macOS and Windows beta clients here: https://github.com/Frontier-Stageworks/stagehand/releases
+Download the latest macOS and Windows clients here: https://github.com/Frontier-Stageworks/stagehand/releases
 
 <br clear="right">
 
