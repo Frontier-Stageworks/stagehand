@@ -1,0 +1,238 @@
+name: Sync Release to R2
+
+# Releases here are published by hand (client installers and the firmware
+# OTA bundle, built elsewhere and uploaded through the GitHub UI/CLI) — this
+# workflow's only job is to mirror a published release's assets to Cloudflare
+# R2 and tell the website which ones they are, so /latest/windows,
+# /latest/macos, and /latest/firmware always point at the current release
+# without anyone touching a URL.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to (re)sync — defaults to the latest published (non-draft, non-prerelease) release. Use this to backfill or retry a failed sync."
+        required: false
+        type: string
+
+# A second trigger for the same tag (e.g. a manual reconcile while the
+# published-release run is still uploading) queues instead of racing or
+# cancelling a part-finished upload. github.event.inputs (not the newer
+# `inputs` context) is used here deliberately: it's a plain object on every
+# trigger type, including `release`, where it's simply empty — so this never
+# risks an invalid property access on a trigger that has no inputs at all.
+concurrency:
+  group: sync-release-${{ github.event.release.tag_name || github.event.inputs.tag || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  R2_BUCKET: frontier-release-assets
+  WEBSITE_BASE_URL: https://www.frontierstageworks.com
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve the release tag to sync
+        id: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          elif [ -n "$EVENT_TAG" ]; then
+            TAG="$EVENT_TAG"
+          else
+            TAG=$(gh release list --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName')
+          fi
+          if [ -z "$TAG" ]; then
+            echo "::error::No release tag to sync (none given, and no published release found)"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      # Only a stable, published release is ever synced — never a draft or
+      # prerelease, and this check applies even on a manual workflow_dispatch
+      # rerun against an older tag.
+      - name: Check the release is stable and published
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --json isDraft,isPrerelease,publishedAt,url > release.json
+          IS_DRAFT=$(jq -r '.isDraft' release.json)
+          IS_PRERELEASE=$(jq -r '.isPrerelease' release.json)
+          if [ "$IS_DRAFT" = "true" ] || [ "$IS_PRERELEASE" = "true" ]; then
+            echo "::notice::${TAG} is a draft or prerelease — skipping sync"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "published_at=$(jq -r '.publishedAt' release.json)" >> "$GITHUB_OUTPUT"
+          echo "notes_url=$(jq -r '.url' release.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Download release assets
+        if: steps.release.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p assets
+          gh release download "$TAG" --dir assets --clobber
+
+      - name: Configure R2 credentials for the AWS CLI
+        if: steps.release.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          aws configure set aws_access_key_id "${{ secrets.R2_ACCESS_KEY_ID }}"
+          aws configure set aws_secret_access_key "${{ secrets.R2_SECRET_ACCESS_KEY }}"
+          aws configure set region auto
+
+      # Filenames are whatever was uploaded by hand (e.g.
+      # "StagehandClient-win.-.beta.0.4.zip"), not a fixed convention, so each
+      # asset is classified by what it looks like rather than an exact
+      # expected name — but loosely enough to go wrong: an early version of
+      # this classified anything containing "win"/"mac" anywhere in its name,
+      # which would have silently synced a stray file like
+      # "darwin-notes.txt" (contains "win") as THE Windows installer. This
+      # classifies in two passes instead: first collect every asset that
+      # *could* fill each of the four roles (windows / macos / firmware
+      # bundle / firmware signature), then refuse to guess if more than one
+      # candidate lands in the same role. Nothing unrecognized is an error —
+      # a release that only updates the client needn't carry firmware — but
+      # genuine ambiguity (two windows-looking files) fails the whole run
+      # rather than silently picking one.
+      - name: Classify release assets
+        if: steps.release.outputs.skip != 'true'
+        id: classify
+        run: |
+          set -euo pipefail
+          shopt -s nocasematch nullglob
+
+          # Plain counters/strings, not associative arrays + namerefs: a
+          # nameref to an EMPTY associative array throws "unbound variable"
+          # under `set -u` (a real bash quirk, confirmed by hand) — and an
+          # empty role (no firmware in this release, say) is the common case,
+          # not the exception. Four scalars apiece is more typing but has no
+          # such trap.
+          windows_count=0; windows_file=""; windows_names=""
+          macos_count=0; macos_file=""; macos_names=""
+          bundle_count=0; bundle_file=""; bundle_names=""
+          sig_count=0; sig_file=""; sig_names=""
+
+          for file in assets/*; do
+            name="$(basename "$file")"
+            case "$name" in
+              stagehand*.tar.zst.sig)
+                sig_count=$((sig_count + 1)); sig_file="$file"
+                sig_names="${sig_names}${sig_names:+, }${name}" ;;
+              stagehand*.tar.zst)
+                bundle_count=$((bundle_count + 1)); bundle_file="$file"
+                bundle_names="${bundle_names}${bundle_names:+, }${name}" ;;
+              *.exe)
+                windows_count=$((windows_count + 1)); windows_file="$file"
+                windows_names="${windows_names}${windows_names:+, }${name}" ;;
+              stagehandclient*win*)
+                windows_count=$((windows_count + 1)); windows_file="$file"
+                windows_names="${windows_names}${windows_names:+, }${name}" ;;
+              stagehandclient*mac*)
+                macos_count=$((macos_count + 1)); macos_file="$file"
+                macos_names="${macos_names}${macos_names:+, }${name}" ;;
+              *)
+                echo "::warning::Unrecognized release asset, skipping: ${name}" ;;
+            esac
+          done
+
+          ambiguous=0
+          [ "$windows_count" -gt 1 ] && { echo "::error::Multiple candidate Windows assets in this release — refusing to guess which is correct: ${windows_names}"; ambiguous=1; }
+          [ "$macos_count" -gt 1 ] && { echo "::error::Multiple candidate macOS assets in this release — refusing to guess which is correct: ${macos_names}"; ambiguous=1; }
+          [ "$bundle_count" -gt 1 ] && { echo "::error::Multiple candidate firmware bundle assets in this release — refusing to guess which is correct: ${bundle_names}"; ambiguous=1; }
+          [ "$sig_count" -gt 1 ] && { echo "::error::Multiple candidate firmware signature assets in this release — refusing to guess which is correct: ${sig_names}"; ambiguous=1; }
+          if [ "$ambiguous" -eq 1 ]; then
+            echo "::error::Rename or remove the conflicting asset(s) in the GitHub release, then re-run this workflow."
+            exit 1
+          fi
+
+          # Firmware activates only once BOTH its bundle and signature are
+          # synced (see the website's activateIfReady) — so treat having
+          # only one of the pair as a hard error too, rather than silently
+          # uploading a bundle with no signature this run.
+          if [ "$bundle_count" -eq 1 ] && [ "$sig_count" -eq 0 ]; then
+            echo "::error::Firmware bundle found with no matching .sig file — refusing to sync an unsigned bundle."
+            exit 1
+          fi
+          if [ "$sig_count" -eq 1 ] && [ "$bundle_count" -eq 0 ]; then
+            echo "::error::Firmware .sig found with no matching bundle — refusing to sync an orphaned signature."
+            exit 1
+          fi
+
+          [ "$windows_count" -eq 1 ] && echo "windows=$windows_file" >> "$GITHUB_OUTPUT"
+          [ "$macos_count" -eq 1 ] && echo "macos=$macos_file" >> "$GITHUB_OUTPUT"
+          [ "$bundle_count" -eq 1 ] && echo "firmware_bundle=$bundle_file" >> "$GITHUB_OUTPUT"
+          [ "$sig_count" -eq 1 ] && echo "firmware_sig=$sig_file" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      # Uploads use the AWS CLI against R2's S3-compatible endpoint, which
+      # multipart-uploads large files automatically.
+      - name: Checksum, upload, and notify for each classified asset
+        if: steps.release.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          PUBLISHED_AT: ${{ steps.release.outputs.published_at }}
+          NOTES_URL: ${{ steps.release.outputs.notes_url }}
+          R2_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          RELEASE_SYNC_SECRET: ${{ secrets.RELEASE_SYNC_SECRET }}
+          WINDOWS_FILE: ${{ steps.classify.outputs.windows }}
+          MACOS_FILE: ${{ steps.classify.outputs.macos }}
+          FIRMWARE_BUNDLE_FILE: ${{ steps.classify.outputs.firmware_bundle }}
+          FIRMWARE_SIG_FILE: ${{ steps.classify.outputs.firmware_sig }}
+        run: |
+          set -euo pipefail
+
+          sync_one() {
+            local file="$1" platform="$2" is_signature="$3"
+            local filename checksum size key payload signature
+            filename="$(basename "$file")"
+            checksum=$(sha256sum "$file" | cut -d' ' -f1)
+            size=$(stat -c%s "$file")
+            key="releases/${platform}/${TAG}/${filename}"
+
+            echo "::notice::Uploading ${filename} -> r2://${R2_BUCKET}/${key}"
+            aws s3 cp "$file" "s3://${R2_BUCKET}/${key}" --endpoint-url "$R2_ENDPOINT"
+
+            payload=$(jq -n \
+              --arg platform "$platform" \
+              --arg version "$TAG" \
+              --arg release_tag "$TAG" \
+              --arg release_notes_url "$NOTES_URL" \
+              --arg published_at "$PUBLISHED_AT" \
+              --arg filename "$filename" \
+              --arg r2_key "$key" \
+              --argjson size_bytes "$size" \
+              --arg checksum_sha256 "$checksum" \
+              --argjson is_signature "$is_signature" \
+              '{platform:$platform, version:$version, release_tag:$release_tag, release_notes_url:$release_notes_url, published_at:$published_at, filename:$filename, r2_key:$r2_key, size_bytes:$size_bytes, checksum_sha256:$checksum_sha256, is_signature:$is_signature}')
+            signature="sha256=$(printf '%s' "$payload" | openssl dgst -sha256 -hmac "$RELEASE_SYNC_SECRET" | awk '{print $NF}')"
+
+            echo "::notice::Notifying website: ${platform} ${filename}"
+            curl -fsS -X POST "${WEBSITE_BASE_URL}/api/releases/notify" \
+              -H "Content-Type: application/json" \
+              -H "X-Release-Sync-Signature: ${signature}" \
+              -d "$payload"
+          }
+
+          [ -n "${WINDOWS_FILE:-}" ] && sync_one "$WINDOWS_FILE" windows false
+          [ -n "${MACOS_FILE:-}" ] && sync_one "$MACOS_FILE" macos false
+          [ -n "${FIRMWARE_BUNDLE_FILE:-}" ] && sync_one "$FIRMWARE_BUNDLE_FILE" firmware false
+          [ -n "${FIRMWARE_SIG_FILE:-}" ] && sync_one "$FIRMWARE_SIG_FILE" firmware true
+          exit 0
